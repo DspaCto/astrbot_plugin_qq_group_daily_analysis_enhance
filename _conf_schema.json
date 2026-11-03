@@ -1,0 +1,42 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用分群总结定向",
+    "default": true,
+    "hint": "作用：关闭后不注入方向、不过滤话题，完全恢复群分析插件原行为。插件页总开关仍然是最高优先级。"
+  },
+  "focus_keywords": {
+    "type": "text",
+    "description": "内容方向关键词",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "plaintext",
+    "hint": "作用：定义内容方向关键词，每行格式 关键词-具体内容的解释。示例：健康-和健康有关，着重于饮食和睡眠。注意：关键词里不要出现 -、|、[ ]、【 】、换行；解释里可以含中文标点，但不要含换行、|、[ ]、【 】，否则会理解错乱。"
+  },
+  "group_focus_map": {
+    "type": "text",
+    "description": "群号=关注方向",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "plaintext",
+    "hint": "作用：每行 群号=关键词1|关键词2；关键词必须来自上面的“内容方向关键词”，只写关键词，不要写解释。多个关键词只用 | 分隔；不要写未定义的关键词。示例：419566332=健康|技术"
+  },
+  "enable_label_filter": {
+    "type": "bool",
+    "description": "按方向标签硬过滤",
+    "default": true,
+    "hint": "作用：只保留 topic 以 [关键词] 开头、且关键词在白名单内的话题；没有标签时用关键词/解释兜底。关闭后只做提示词引导，不过滤。"
+  },
+  "fallback_on_content_reject": {
+    "type": "bool",
+    "description": "内容审核拒绝时自动换备用 Provider",
+    "default": true,
+    "hint": "作用：群分析调用遇到 content_check_error、sensitive content 等内容审核拒绝时，自动改用下面的备用 Provider 重试；关闭后保持原插件行为。"
+  },
+  "fallback_provider_id": {
+    "type": "string",
+    "description": "备用 Provider ID",
+    "default": "deepseek-flash",
+    "hint": "作用：内容审核被拒时使用的 AstrBot Provider ID，默认官方 deepseek-flash。必须与提供商列表里的 ID 完全一致。"
+  }
+}
