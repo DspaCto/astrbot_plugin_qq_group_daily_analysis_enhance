@@ -1,4 +1,4 @@
-"""群总结扩展补丁（群分析总结插件的按群定向 + 内容审核回退扩展）
+"""群总结扩展补丁（群分析总结插件的扩展集合）
 
 作用：
 - 在“内容方向关键词”里定义 关键词-具体内容的解释；
@@ -7,25 +7,34 @@
 - 分析后按 [关键词] 前缀白名单过滤话题（可开关）；
 - 分析 LLM 遇到内容审核拒绝时，自动识别并临时切换到备用 Provider
   （默认 deepseek-flash），避免无人值守时整份报告失败；
-- 插件页总开关关掉时，恢复原插件行为，不修改原插件源码。
+- 管理员私聊说“分析历史”时，按“接收者<-分析群号”把增量报告发送到指定私聊或群；
+- 插件页总开关关闭时，恢复原插件行为，不修改原插件源码。
 
 依赖：astrbot_plugin_qq_group_daily_analysis
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import datetime
 import importlib
 import re
 import sys
+import time
+import unicodedata
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 ANALYSIS_PLUGIN = "astrbot_plugin_qq_group_daily_analysis"
 LABEL_RE = re.compile(r"^\s*[\[【]([^\]】]+)[\]】]\s*[:：]?\s*")
+HISTORY_CURSOR_KEY = "delivery_cursors"
+# 作用：路由格式 [接收者UMO]<-[群号]；群号可带方括号。
+ROUTE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*<-\s*\[?(\d+)\]?\s*$")
 
 # 作用：在同一次话题分析调用里传递“本群关键词+解释”，避免并发分析串群
 _CURRENT_FOCUS: contextvars.ContextVar[list[tuple[str, str]] | None] = (
@@ -36,8 +45,8 @@ _CURRENT_FOCUS: contextvars.ContextVar[list[tuple[str, str]] | None] = (
 @register(
     "astrbot_plugin_qq_group_daily_analysis_enhance",
     "DspaCto",
-    "群总结扩展补丁：按群定向 + 内容审核自动回退",
-    "1.4.0",
+    "群总结扩展补丁：按群定向 + 内容审核自动回退 + 历史报告路由",
+    "1.7.0",
 )
 class GroupDailyFocus(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -50,13 +59,15 @@ class GroupDailyFocus(Star):
         self._incremental_cm = None
         self._incremental_original = None
         self._active = False
+        self._history_tasks: set[asyncio.Task] = set()
+        self._history_run_lock = asyncio.Lock()
         self._apply_patch()
 
     # ---------- 配置读取 ----------
     @property
     def _enabled(self) -> bool:
-        # 作用：插件自身开关；关掉后只做原插件行为
-        return bool(self.config.get("enabled", True))
+        # 作用：插件加载即启用；总开关在 AstrBot 的上级插件页
+        return True
 
     @property
     def _fallback_enabled(self) -> bool:
@@ -70,8 +81,59 @@ class GroupDailyFocus(Star):
         # 作用：内容审核被拒时使用的备用 Provider ID
         return str(self.config.get("fallback_provider_id", "deepseek-flash")).strip()
 
+    @property
+    def _initial_lookback_days(self) -> int:
+        # 作用：还没有发送游标时，从几天前开始找报告
+        return max(1, min(int(self.config.get("initial_lookback_days", 7)), 7))
+
+    @property
+    def _max_history_batches(self) -> int:
+        # 作用：一次最多发送多少份报告，避免单次刷屏
+        return max(1, min(int(self.config.get("max_batches_per_reply", 30)), 100))
+
+    @property
+    def _max_force_loops(self) -> int:
+        # 作用：强制增量同步最多循环几次（每次最多 900 条）
+        return max(1, min(int(self.config.get("max_force_loops", 10)), 20))
+
+    def _receiver_routes(self) -> list[tuple[str, str]]:
+        """作用：解析“接收者<-分析群号”，返回 (分析群号, 接收者 UMO) 列表。"""
+        raw = self.config.get("receiver_routes", "")
+        if not isinstance(raw, str) or not raw.strip():
+            return []
+        routes: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # 作用：容忍全角括号/箭头和中英文输入法混用
+            line = (
+                line.replace("【", "[")
+                .replace("】", "]")
+                .replace("＜", "<")
+                .replace("＞", ">")
+                .replace("－", "-")
+            )
+            match = ROUTE_RE.match(line)
+            if not match:
+                logger.warning(
+                    f"[group-focus] 忽略格式不正确的接收者路由：{line[:80]}"
+                )
+                continue
+            umo = match.group(1).strip()
+            group_id = match.group(2).strip()
+            if not umo or not group_id:
+                continue
+            key = (group_id, umo)
+            if key in seen:
+                continue
+            seen.add(key)
+            routes.append(key)
+        return routes
+
     def _keyword_definitions(self) -> dict[str, str]:
-        """作用：解析“关键词-具体内容的解释”，一行一个；只按第一个 - 分割。"""
+        """作用：解析“关键词--具体内容”，一行一个；优先按 -- 分割，兼容旧的单 - 格式。"""
         raw = self.config.get("focus_keywords", "")
         if not isinstance(raw, str) or not raw.strip():
             return {}
@@ -80,10 +142,15 @@ class GroupDailyFocus(Star):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "-" not in line:
-                logger.debug(f"[group-focus] 忽略没有 - 的关键词行：{line[:40]}")
+            separator = "--" if "--" in line else "-"
+            if separator not in line:
+                logger.debug(f"[group-focus] 忽略没有 -- 的关键词行：{line[:40]}")
                 continue
-            keyword, explanation = line.split("-", 1)
+            if separator == "-":
+                logger.warning(
+                    "[group-focus] 检测到旧的关键词格式（单 -），建议改成 --"
+                )
+            keyword, explanation = line.split(separator, 1)
             keyword = keyword.strip()
             explanation = explanation.strip()
             if not keyword or not explanation:
@@ -106,7 +173,13 @@ class GroupDailyFocus(Star):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, value = line.split("=", 1)
+            if "==" in line:
+                key, value = line.split("==", 1)
+            else:
+                key, value = line.split("=", 1)
+                logger.warning(
+                    "[group-focus] 检测到旧的分析群号格式（单 =），建议改成 =="
+                )
             key = key.strip()
             if not key:
                 continue
@@ -484,6 +557,415 @@ class GroupDailyFocus(Star):
             )
         return kept
 
+    # ---------- 私聊群历史报告（原 group_history_bridge 功能） ----------
+    @filter.llm_tool("request_group_history_analysis")
+    async def request_group_history_analysis(
+        self,
+        event: AstrMessageEvent,
+        days: int = 7,
+        analysis_sections: str = "全部",
+    ) -> str:
+        """当管理员在私聊中要求“分析历史 / 群分析 / 生成群报告 / 看看群最近聊了什么 / 总结最近的群聊”时调用。
+
+        作用：按“接收者<-分析群号”路由，把每个分析群上次发送之后的增量批次报告发到对应接收者，
+        并强制同步一次每个群当前未满 900 条的尾巴。每条报告都带时间戳（该批最后一条消息的时间）。
+
+        使用规则：
+        - 只有 AstrBot 管理员可以使用；普通群友调用会被拒绝。
+        - 只在私聊中使用；如果在群聊中调用，会提示用户私聊。
+        - 不需要向用户索要群号、文件路径或脚本；群号和接收者来自插件配置。
+        - 当前私聊只负责触发；报告会发到“接收者<-分析群号”里配置的 UMO。
+        - 本工具立即返回“已开始”，报告由后台任务在分析完成后单独发送，不要编造分析结果。
+        - days 只用于第一次请求的初始回看范围（1-7 天，默认 7）；之后按“上次发送游标”继续。
+        """
+        if not event.is_admin():
+            return "[权限不足] 群历史分析仅管理员可用。"
+        if event.get_group_id():
+            return "[提示] 请在私聊里对我说“分析历史”，我会按配置把报告发到对应接收者。"
+        star = self._analysis_plugin()
+        if star is None:
+            return "[错误] 群分析插件未加载，暂时无法生成报告。"
+        routes = self._receiver_routes()
+        if not routes:
+            return "[未配置] 请先在插件配置的“接收者<-分析群号”里填写至少一条路由。"
+        try:
+            days_int = max(1, min(int(days), 7))
+        except (TypeError, ValueError):
+            days_int = self._initial_lookback_days
+        task = asyncio.create_task(
+            self._run_routes(
+                event, star, routes, days_int, str(analysis_sections or "全部")
+            )
+        )
+        self._history_tasks.add(task)
+        task.add_done_callback(self._history_tasks.discard)
+        return (
+            f"[已开始] 正在按 {len(routes)} 条路由整理报告并同步尾巴；"
+            "完成后会发到对应接收者。"
+        )
+
+    @filter.on_llm_request(priority=100)
+    async def inject_history_hint(self, event: AstrMessageEvent, req):
+        """作用：在管理员私聊时注入一句规则，避免模型改去要群号/路径/脚本。"""
+        try:
+            if not event.is_admin() or event.get_group_id():
+                return
+            req.system_prompt = (req.system_prompt or "") + (
+                "\n\n[群历史分析规则]\n"
+                "当管理员说“分析历史 / 群分析 / 生成群报告 / 看看群最近聊了什么 / 总结最近的群聊”时，"
+                "必须优先调用 request_group_history_analysis 工具，不要向用户索要群号、路径或脚本；"
+                "该工具会按“接收者<-分析群号”路由发送增量报告，并强制同步当前未满 900 条的尾巴。\n"
+            )
+        except Exception:
+            return
+
+    def _analysis_plugin(self):
+        """作用：按插件名找到已加载的群分析插件实例。"""
+        meta = self.context.get_registered_star(ANALYSIS_PLUGIN)
+        return getattr(meta, "star_cls", None) if meta else None
+
+    async def _run_routes(self, event, star, routes, days: int, sections: str):
+        """作用：逐条路由发送；某条失败不影响其他路由，最后把状态发回触发者。"""
+        platform_id = str(event.get_platform_id() or "")
+        requester_umo = event.unified_msg_origin
+        delivered = 0
+        errors: list[str] = []
+        for group_id, target_umo in routes:
+            try:
+                delivered += await self._run_and_deliver(
+                    star, group_id, target_umo, platform_id, days, sections
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[group-focus] 群历史分析或发送失败（群 {group_id}）: {exc}",
+                    exc_info=True,
+                )
+                errors.append(f"{group_id}: {exc}")
+        if errors:
+            detail = "；".join(errors[:3])
+            prefix = "[部分失败]" if delivered else "[分析失败]"
+            await self._send(requester_umo, f"{prefix} {detail}")
+        elif delivered == 0:
+            await self._send(requester_umo, "没有新的群消息需要总结。")
+
+    async def _run_and_deliver(
+        self,
+        star,
+        group_id: str,
+        target_umo: str,
+        platform_id: str,
+        days: int,
+        sections: str,
+    ) -> int:
+        """作用：强制同步尾巴 → 取出游标之后的批次 → 格式化发到目标 → 推进游标。"""
+        async with self._history_run_lock:
+            cursor = await self._load_cursor(target_umo, group_id)
+            if cursor <= 0:
+                lookback_days = max(days, self._initial_lookback_days)
+                cursor = int(time.time() - lookback_days * 86400)
+
+            # 1) 手动触发一次增量同步，把未满 900 条的尾巴也总结掉
+            await self._force_tail(star, group_id, platform_id)
+
+            # 2) 取游标之后的所有批次（自动 900 条批次 + 刚同步的尾巴）
+            batches = await self._list_batches_after(star, group_id, cursor)
+            if not batches:
+                return 0
+
+            truncated = len(batches) > self._max_history_batches
+            batches = batches[: self._max_history_batches]
+            texts = self._format_batches(group_id, batches, cursor, sections)
+            for text in texts:
+                await self._send(target_umo, text)
+
+            new_cursor = max(
+                int(getattr(b, "last_message_timestamp", 0) or 0) for b in batches
+            )
+            await self._save_cursor(target_umo, group_id, new_cursor)
+            if truncated:
+                await self._send(
+                    target_umo,
+                    "（本次先发这么多，还有更多报告；再问一次“分析历史”继续。）",
+                )
+            return len(batches)
+
+    async def _force_tail(self, star, group_id: str, platform_id: str):
+        """作用：调用带 force 的增量分析，把未满阈值的尾巴也生成批次。"""
+        limit = int(star.config_manager.get_incremental_min_messages())
+        for _ in range(self._max_force_loops):
+            try:
+                result = await star.analysis_service.execute_incremental_analysis(
+                    group_id=group_id,
+                    platform_id=platform_id,
+                    force=True,
+                )
+            except TypeError:
+                logger.error(
+                    "[group-focus] 群分析插件缺少 force 补丁，无法手动同步尾巴"
+                )
+                return
+            if not isinstance(result, dict) or not result.get("success"):
+                return
+            count = int(result.get("messages_count", 0) or 0)
+            if count <= 0 or count < limit:
+                return
+        logger.info("[group-focus] 强制增量达到循环上限，剩余消息留到下次")
+
+    async def _list_batches_after(self, star, group_id: str, cursor: int):
+        """作用：取 last_message_timestamp 大于游标的批次，按时间升序。"""
+        store = getattr(star.analysis_service, "incremental_store", None)
+        if store is None:
+            return []
+        batches = await store.query_batches(group_id, 0, time.time() + 60)
+        batches = [
+            b
+            for b in batches
+            if int(getattr(b, "last_message_timestamp", 0) or 0) > cursor
+        ]
+        batches.sort(
+            key=lambda b: (
+                int(getattr(b, "last_message_timestamp", 0) or 0),
+                float(getattr(b, "timestamp", 0) or 0),
+            )
+        )
+        return batches
+
+    @staticmethod
+    def _display_nickname(name: str) -> str:
+        """作用：昵称宽度不超过4个汉字时全显示，否则取前3个字；半角字符按0.5个汉字计。"""
+        value = str(name or "").strip()
+        if not value:
+            return ""
+        units = 0.0
+        for char in value:
+            if unicodedata.east_asian_width(char) in {"W", "F"}:
+                units += 1.0
+            else:
+                units += 0.5
+        return value if units <= 4.0 else value[:3]
+
+    def _format_mentions(
+        self,
+        text: str,
+        uid_to_name: dict[str, str],
+        name_to_uid: dict[str, str],
+        seen_uids: set[str],
+    ) -> str:
+        """作用：正文里的 QQ 号/昵称统一成 [显示名-QQ] 或 [显示名]；每份报告只带一次 QQ。"""
+        text = str(text or "")
+        if not text or not uid_to_name:
+            return text
+        alternatives = [
+            re.escape(name)
+            for name in sorted(name_to_uid, key=len, reverse=True)
+            if name
+        ]
+        if uid_to_name:
+            alternatives.append(r"(?<![:\d])\d{5,12}(?![\d:])")
+        pattern = re.compile(r"\[?(?:" + "|".join(alternatives) + r")\]?")
+
+        def repl(match: re.Match) -> str:
+            raw = match.group(0)
+            token = raw.strip("[]").strip()
+            uid = name_to_uid.get(token)
+            if uid is None and token in uid_to_name:
+                uid = token
+            if uid is None:
+                return raw
+            display = self._display_nickname(uid_to_name.get(uid, ""))
+            if not display:
+                return raw
+            if uid in seen_uids:
+                return f"[{display}]"
+            seen_uids.add(uid)
+            return f"[{display}-{uid}]"
+
+        return pattern.sub(repl, text)
+
+    def _format_batches(
+        self, group_id: str, batches: list, cursor: int, sections: str
+    ) -> list[str]:
+        """作用：把增量批次逐份格式化成独立 Markdown 消息，返回消息列表。"""
+        include_topics, include_quotes, include_quality = self._parse_sections(
+            sections
+        )
+        texts: list[str] = []
+        prev_ts = int(cursor)
+        total = len(batches)
+        for index, batch in enumerate(batches, 1):
+            text, prev_ts = self._format_one_batch(
+                group_id,
+                batch,
+                index,
+                total,
+                prev_ts,
+                include_topics,
+                include_quotes,
+                include_quality,
+            )
+            texts.append(text)
+        return texts
+
+    def _format_one_batch(
+        self,
+        group_id: str,
+        batch,
+        index: int,
+        total: int,
+        start_ts: int,
+        include_topics: bool,
+        include_quotes: bool,
+        include_quality: bool,
+    ) -> tuple[str, int]:
+        """作用：格式化单份报告；首次提及群员带 QQ，后续只写显示名。"""
+        user_stats = getattr(batch, "user_stats", None) or {}
+        uid_to_name: dict[str, str] = {}
+        name_to_uid: dict[str, str] = {}
+        if isinstance(user_stats, dict):
+            for uid, info in user_stats.items():
+                if not isinstance(info, dict):
+                    continue
+                name = str(info.get("nickname") or info.get("name") or "").strip()
+                if not name:
+                    continue
+                uid_str = str(uid)
+                uid_to_name[uid_str] = name
+                name_to_uid.setdefault(name, uid_str)
+
+        seen_uids: set[str] = set()
+        last_ts = int(getattr(batch, "last_message_timestamp", 0) or 0)
+        start_text = self._fmt_ts(start_ts) if start_ts > 0 else "上次发送之后"
+        end_text = self._fmt_ts(last_ts)
+        lines = [
+            f"### 群聊增量报告（{index}/{total}）",
+            f"- 群: {group_id}",
+            f"- 覆盖时间: {start_text} ~ {end_text}",
+            f"- 消息数: {int(getattr(batch, 'messages_count', 0) or 0)}",
+        ]
+
+        participants = getattr(batch, "participant_ids", None) or getattr(
+            batch, "user_stats", None
+        )
+        if participants:
+            try:
+                lines.append(f"- 参与人数: {len(participants)}")
+            except Exception:
+                pass
+
+        topics = getattr(batch, "topics", None) or []
+        if include_topics and topics:
+            lines.append("- 话题:")
+            for topic in topics[:5]:
+                if not isinstance(topic, dict):
+                    continue
+                name = self._format_mentions(
+                    str(topic.get("topic", "")).strip(),
+                    uid_to_name,
+                    name_to_uid,
+                    seen_uids,
+                )
+                detail = self._format_mentions(
+                    str(topic.get("detail", "")).strip(),
+                    uid_to_name,
+                    name_to_uid,
+                    seen_uids,
+                )
+                lines.append(f"  - {name}" + (f"：{detail}" if detail else ""))
+
+        quotes = getattr(batch, "golden_quotes", None) or []
+        if include_quotes and quotes:
+            lines.append("- 金句:")
+            for quote in quotes[:5]:
+                if not isinstance(quote, dict):
+                    continue
+                content = self._format_mentions(
+                    str(quote.get("content", "")).strip(),
+                    uid_to_name,
+                    name_to_uid,
+                    seen_uids,
+                )
+                sender = self._format_mentions(
+                    str(quote.get("sender", "")).strip(),
+                    uid_to_name,
+                    name_to_uid,
+                    seen_uids,
+                )
+                reason = self._format_mentions(
+                    str(quote.get("reason", "")).strip(),
+                    uid_to_name,
+                    name_to_uid,
+                    seen_uids,
+                )
+                lines.append(
+                    f"  - “{content}” — {sender}"
+                    + (f"（{reason}）" if reason else "")
+                )
+
+        review = getattr(batch, "chat_quality_review", None)
+        if include_quality and isinstance(review, dict):
+            summary = self._format_mentions(
+                str(review.get("summary", "")).strip(),
+                uid_to_name,
+                name_to_uid,
+                seen_uids,
+            )
+            if summary:
+                lines.append(f"- 聊天质量: {summary}")
+
+        return "\n".join(lines).strip(), last_ts
+
+    @staticmethod
+    def _parse_sections(sections: str) -> tuple[bool, bool, bool]:
+        """作用：解析要显示的报告模块；默认全部显示。"""
+        raw = str(sections or "全部").strip()
+        lower = raw.lower()
+        if not raw or raw in {"全部", "all"} or lower == "all":
+            return True, True, True
+        include_topics = "话题" in raw or "topic" in lower
+        include_quotes = "金句" in raw or "quote" in lower
+        include_quality = "质量" in raw or "quality" in lower
+        if not (include_topics or include_quotes or include_quality):
+            return True, True, True
+        return include_topics, include_quotes, include_quality
+
+    @staticmethod
+    def _fmt_ts(timestamp: int) -> str:
+        """作用：把 epoch 转成 UTC+8 的“年月日 时:分”。"""
+        try:
+            return datetime.datetime.fromtimestamp(int(timestamp)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except Exception:
+            return str(timestamp)
+
+    async def _load_cursor(self, umo: str, group_id: str) -> int:
+        """作用：读取某条“接收者 + 分析群”路由上次收到报告的最后一条消息时间。"""
+        data = await self.get_kv_data(HISTORY_CURSOR_KEY, {})
+        if isinstance(data, dict):
+            try:
+                return int(data.get(f"{group_id}|{umo}", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    async def _save_cursor(self, umo: str, group_id: str, timestamp: int) -> None:
+        """作用：保存某条路由已经发到哪条消息。"""
+        data = await self.get_kv_data(HISTORY_CURSOR_KEY, {})
+        if not isinstance(data, dict):
+            data = {}
+        data[f"{group_id}|{umo}"] = int(timestamp)
+        await self.put_kv_data(HISTORY_CURSOR_KEY, data)
+
+    async def _send(self, umo: str, text: str):
+        """作用：把报告分段发到指定会话，避免单条消息过长。"""
+        text = (text or "").strip() or "[没有可发送的内容]"
+        limit = 3500
+        for start in range(0, len(text), limit):
+            await self.context.send_message(
+                umo, MessageChain([Plain(text[start : start + limit])])
+            )
+            await asyncio.sleep(0.3)
+
     # ---------- 生命周期 ----------
     @filter.on_plugin_loaded()
     async def _on_plugin_loaded(self, metadata: Any, *args: Any, **kwargs: Any) -> None:
@@ -492,5 +974,8 @@ class GroupDailyFocus(Star):
             self._apply_patch()
 
     async def terminate(self) -> None:
-        # 作用：插件被关闭/卸载时撤销补丁
+        # 作用：插件被关闭/卸载时停止后台报告任务并撤销补丁
+        for task in list(self._history_tasks):
+            task.cancel()
+        self._history_tasks.clear()
         self._unpatch()
