@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.4.0
+
+- 增量分析触发与定时分析名单解耦：即使 `scheduled_group_list` 为空，`incremental_group_list` 里的群仍会按 900 条静默生成批次。
+- 新增配置项 `decouple_incremental_from_scheduled`（默认开启）。
+- 文档补充：`max_messages` 调高用于回填，桥接强制循环上限提高。
+
 ## v1.3.0
 
 - 内部插件 ID 改为 `astrbot_plugin_qq_group_daily_analysis_enhance`，显示名改为「群总结扩展补丁」。

@@ -37,7 +37,7 @@ _CURRENT_FOCUS: contextvars.ContextVar[list[tuple[str, str]] | None] = (
     "astrbot_plugin_qq_group_daily_analysis_enhance",
     "DspaCto",
     "群总结扩展补丁：按群定向 + 内容审核自动回退",
-    "1.3.0",
+    "1.4.0",
 )
 class GroupDailyFocus(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -47,6 +47,8 @@ class GroupDailyFocus(Star):
         self._original_analyze = None
         self._original_build = None
         self._llm_module = None
+        self._incremental_cm = None
+        self._incremental_original = None
         self._active = False
         self._apply_patch()
 
@@ -146,6 +148,85 @@ class GroupDailyFocus(Star):
         except Exception as exc:
             logger.debug(f"[group-focus] llm_utils 尚未可导入: {exc}")
             return None
+
+    def _analysis_config_manager(self):
+        """作用：找到群分析插件的 ConfigManager，用于解耦增量名单和定时名单。"""
+        meta = self.context.get_registered_star(ANALYSIS_PLUGIN)
+        star = getattr(meta, "star_cls", None) if meta else None
+        return getattr(star, "config_manager", None) if star else None
+
+    def _apply_incremental_decouple_patch(self) -> None:
+        """作用：让增量分析只按基础群权限 + 增量名单判断，不被空的定时名单连带关闭。"""
+        if not self._enabled:
+            return
+        if not bool(self.config.get("decouple_incremental_from_scheduled", True)):
+            return
+        config_manager = self._analysis_config_manager()
+        if config_manager is None:
+            return
+
+        # 重复加载时先拆掉旧闭包，避免旧插件实例继续生效。
+        if getattr(config_manager, "_enhance_incremental_patched", False):
+            current = getattr(config_manager, "is_incremental_group_allowed", None)
+            original = getattr(current, "_group_focus_original", None)
+            if original is None:
+                return
+            config_manager.is_incremental_group_allowed = original
+            config_manager._enhance_incremental_patched = False
+
+        original = config_manager.is_incremental_group_allowed
+        plugin = self
+
+        def patched_is_incremental_group_allowed(group_umo_or_id):
+            if not plugin._enabled or not bool(
+                plugin.config.get("decouple_incremental_from_scheduled", True)
+            ):
+                return original(group_umo_or_id)
+            try:
+                if not config_manager.is_group_allowed(group_umo_or_id):
+                    return False
+                mode = config_manager.get_incremental_group_list_mode()
+                if mode == "inherit":
+                    return True
+                return config_manager.is_group_in_filtered_list(
+                    group_umo_or_id,
+                    mode,
+                    config_manager.get_incremental_group_list(),
+                )
+            except Exception as exc:
+                logger.debug(f"[group-focus] 增量名单解耦判断失败，回退原逻辑: {exc}")
+                return original(group_umo_or_id)
+
+        patched_is_incremental_group_allowed._group_focus_patched = True
+        patched_is_incremental_group_allowed._group_focus_original = original
+        config_manager.is_incremental_group_allowed = (
+            patched_is_incremental_group_allowed
+        )
+        config_manager._enhance_incremental_patched = True
+        config_manager._enhance_incremental_original = original
+        self._incremental_cm = config_manager
+        self._incremental_original = original
+        logger.info("[group-focus] 已应用增量触发解耦补丁")
+
+    def _unpatch_incremental_decouple(self) -> None:
+        """作用：恢复增量名单判断原方法。"""
+        config_manager = self._incremental_cm
+        if config_manager is None:
+            return
+        try:
+            if getattr(config_manager, "_enhance_incremental_patched", False):
+                original = getattr(
+                    config_manager, "_enhance_incremental_original", None
+                )
+                if original is not None:
+                    config_manager.is_incremental_group_allowed = original
+                config_manager._enhance_incremental_patched = False
+                logger.info("[group-focus] 已恢复增量触发解耦补丁")
+        except Exception as exc:
+            logger.warning(f"[group-focus] 恢复增量解耦补丁失败: {exc}")
+        finally:
+            self._incremental_cm = None
+            self._incremental_original = None
 
     def _apply_llm_fallback_patch(self) -> None:
         """作用：让群分析插件把 content_check_error 识别为内容风控，并在失败时切备用 Provider。"""
@@ -255,8 +336,9 @@ class GroupDailyFocus(Star):
             self._llm_module = None
 
     def _apply_patch(self) -> None:
-        # 作用：把按群定向的包装套到 TopicAnalyzer 实例上，并安装内容审核回退
+        # 作用：把按群定向的包装套到 TopicAnalyzer 实例上，并安装内容审核回退/增量解耦
         self._apply_llm_fallback_patch()
+        self._apply_incremental_decouple_patch()
         analyzer = self._topic_analyzer()
         if analyzer is None:
             logger.debug("[group-focus] 群分析插件未就绪，等待 on_plugin_loaded")
@@ -331,6 +413,7 @@ class GroupDailyFocus(Star):
     def _unpatch(self) -> None:
         # 作用：插件关闭/卸载时恢复原方法，保证总开关真的能关掉
         self._unpatch_llm_fallback()
+        self._unpatch_incremental_decouple()
         analyzer = self._patched
         if analyzer is None:
             return

@@ -38,5 +38,11 @@
     "description": "备用 Provider ID",
     "default": "deepseek-flash",
     "hint": "作用：内容审核被拒时使用的 AstrBot Provider ID，默认官方 deepseek-flash。必须与提供商列表里的 ID 完全一致。"
+  },
+  "decouple_incremental_from_scheduled": {
+    "type": "bool",
+    "description": "增量分析不受定时名单影响",
+    "default": true,
+    "hint": "作用：群分析插件原本要求群同时在定时分析名单里才允许增量分析；关闭定时分析后，这会导致每 900 条的静默增量永不触发。开启此项后，只按基础群权限和增量名单判断。"
   }
 }
