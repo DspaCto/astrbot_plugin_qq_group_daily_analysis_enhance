@@ -46,7 +46,7 @@ _CURRENT_FOCUS: contextvars.ContextVar[list[tuple[str, str]] | None] = (
     "astrbot_plugin_qq_group_daily_analysis_enhance",
     "DspaCto",
     "群总结扩展补丁：按群定向 + 内容审核自动回退 + 历史报告路由",
-    "1.7.0",
+    "1.7.1",
 )
 class GroupDailyFocus(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -782,6 +782,17 @@ class GroupDailyFocus(Star):
 
         return pattern.sub(repl, text)
 
+    @staticmethod
+    def _convert_report_brackets(text: str) -> str:
+        """作用：把总结里的方括号统一改成全角白角括号『』。"""
+        return (
+            str(text or "")
+            .replace("[", "『")
+            .replace("]", "』")
+            .replace("［", "『")
+            .replace("］", "』")
+        )
+
     def _format_batches(
         self, group_id: str, batches: list, cursor: int, sections: str
     ) -> list[str]:
@@ -912,7 +923,7 @@ class GroupDailyFocus(Star):
             if summary:
                 lines.append(f"- 聊天质量: {summary}")
 
-        return "\n".join(lines).strip(), last_ts
+        return self._convert_report_brackets("\n".join(lines).strip()), last_ts
 
     @staticmethod
     def _parse_sections(sections: str) -> tuple[bool, bool, bool]:

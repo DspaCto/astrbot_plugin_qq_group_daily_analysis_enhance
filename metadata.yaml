@@ -2,7 +2,7 @@ name: astrbot_plugin_qq_group_daily_analysis_enhance
 display_name: 群总结扩展补丁
 short_desc: 按群定向 + 内容审核自动回退 + 历史报告路由
 desc: 为不同群设置总结关注方向并过滤话题；内容审核拒绝时自动切换备用 Provider（默认 deepseek-flash）；按“接收者<-分析群号”把私聊“分析历史”的增量报告发送到指定私聊或群；依赖 astrbot_plugin_qq_group_daily_analysis
-version: v1.7.0
+version: v1.7.1
 author: DspaCto
 repo: https://github.com/DspaCto/astrbot_plugin_qq_group_daily_analysis_enhance
 astrbot_version: ">=4.24.1"
